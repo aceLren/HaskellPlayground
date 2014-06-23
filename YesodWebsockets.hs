@@ -1,53 +1,84 @@
-{-# LANGUAGE QuasiQuotes, TemplateHaskell, TypeFamilies, OverloadedStrings #-}
+{-# LANGUAGE QuasiQuotes, TemplateHaskell, TypeFamilies, OverloadedStrings, GADTs #-}
+{-# LANGUAGE MultiParamTypeClasses, FlexibleContexts, GeneralizedNewtypeDeriving #-}
 
-import Yesod.Core                   as YC
-import Yesod.WebSockets             as YW
-import qualified Data.Text.Lazy     as TL
-import qualified Control.Monad      as CM
-import Control.Monad.Trans.Reader   as R
+import qualified Yesod                          as Y
+import qualified Yesod.Core                     as YC
+import qualified Yesod.WebSockets               as YW
+import qualified Database.MongoDB               as MD
+import qualified Database.Persist               as P
+import qualified Database.Persist.TH            as TH
+import qualified Language.Haskell.TH.Syntax     as TS
+import qualified Database.Persist.MongoDB       as MP
+import qualified Data.Text.Lazy                 as TL
+import qualified Control.Monad                  as CM
+import qualified Control.Monad.Trans.Reader     as R
 import Control.Concurrent (threadDelay)
-import Data.Time                    as T
-import Data.Conduit                 as C
-import Data.Conduit.List            as CL
+import qualified Data.Time                      as T
+import qualified Data.Conduit                   as C
+import qualified Data.Conduit.List              as CL
 import Data.Monoid ((<>))
-import Control.Concurrent.STM.Lifted as L
+import qualified Control.Concurrent.STM.Lifted  as L
 import Data.Text (Text)
+import Debug.Trace
 
-data App = App (TChan Text)
+data App = App (L.TChan Text) MP.MongoConf MP.ConnectionPool
 
---mapM_C :: (MonoFoldable c, Monad m) => (Element c -> m ()) -> Consumer c m ()
---mapM_C = CL.mapM_ . CM.mapM_
+instance YC.Yesod App
+instance Y.YesodPersist App where
+    type YesodPersistBackend App = MP.Action
+    runDB act = do
+        App ch conf pool <- YC.getYesod
+        MP.runPool conf act pool
 
-instance Yesod App
+TH.share [TH.mkPersist (TH.mkPersistSettings (TS.ConT ''MP.MongoBackend)) { TH.mpsGeneric = False }, 
+          TH.mkMigrate "migrateAll"] [TH.persistLowerCase|
+User
+    name Text Eq
+    msg Text
 
-mkYesod "App" [parseRoutes|
+Other
+    name Text
+    deriving Show Eq Read
+|]
+
+YC.mkYesod "App" [YC.parseRoutes|
 / HomeR GET
 |]
 
-chatApp :: WebSocketsT Handler ()
+chatApp :: YW.WebSocketsT Handler ()
 chatApp = do
     YW.sendTextData ("Welcome to the chat server, please enter your name." :: Text)
     name <- YW.receiveData
     YW.sendTextData $ "Welcome, " <> name
-    App writeChan <- YC.getYesod
-    readChan <- L.atomically $ do
-        L.writeTChan writeChan $ name <> " has joined the chat"
-        L.dupTChan writeChan
-    YW.race_
-        (CM.forever $ L.atomically (L.readTChan readChan) >>= YW.sendTextData)
-        (YW.sourceWS $$ CL.mapM_ (\msg ->
-            L.atomically $ writeTChan writeChan $ name <> ": " <> msg))
+    App writeChan conf pool <- YC.getYesod
 
-getHomeR :: Handler Html
+    YC.lift (Y.runDB $ MP.insert $ User "ace" "this is a msg")
+
+    readChan <- L.atomically $ do
+        -- First tell everyone already here this guy has joined
+        L.writeTChan writeChan $ name <> " has joined the chat"
+        -- Then duplicate, this is the only way to read
+        L.dupTChan writeChan
+    YW.race_ -- Both of these are forever
+        (CM.forever $ L.atomically (L.readTChan readChan) >>= YW.sendTextData)
+        (YW.sourceWS C.$$ CL.mapM_ (\msg -> do
+            L.atomically $ L.writeTChan writeChan $ name <> ": " <> msg
+            CM.void $ YC.lift (Y.runDB $ MP.insert $ User name msg) ))
+
+getHomeR :: Handler YC.Html
 getHomeR = do
+    Y.runDB $ MP.insert $ User "ace" "this is a msg"
+    --trace "\nSocketTime!!\n" 
     YW.webSockets chatApp
+
+    --trace "\nLayoutTime!!\n" 
     YC.defaultLayout $ do
-        [whamlet|
+        [YC.whamlet|
             <div #output>
             <form #form>
                 <input #input autofocus>
         |]
-        YC.toWidget [lucius|
+        YC.toWidget [YC.lucius|
             \#output {
                 width: 600px;
                 height: 400px;
@@ -64,7 +95,7 @@ getHomeR = do
                 display: block;
             }
         |]
-        YC.toWidget [julius|
+        YC.toWidget [YC.julius|
             var url = document.URL,
                 output = document.getElementById("output"),
                 form = document.getElementById("form"),
@@ -90,4 +121,7 @@ getHomeR = do
 main :: IO ()
 main = do
     chan <- L.atomically L.newBroadcastTChan
-    YC.warp 3000 $ App chan
+    let conf = MP.defaultMongoConf "yesodTest"
+    MP.withConnection conf $ \pool ->
+        YC.warp 3000 $ App chan conf pool
+    
