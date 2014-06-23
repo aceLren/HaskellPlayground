@@ -52,8 +52,6 @@ chatApp = do
     YW.sendTextData $ "Welcome, " <> name
     App writeChan conf pool <- YC.getYesod
 
-    YC.lift (Y.runDB $ MP.insert $ User "ace" "this is a msg")
-
     readChan <- L.atomically $ do
         -- First tell everyone already here this guy has joined
         L.writeTChan writeChan $ name <> " has joined the chat"
